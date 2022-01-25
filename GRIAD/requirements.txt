@@ -1,0 +1,8 @@
+pickle5
+tqdm
+matplotlib
+gym
+dm-haiku
+optax
+coax
+
