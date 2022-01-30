@@ -248,6 +248,7 @@ class SAC():
 
         targets = self.compute_targets(transitions)
         self.update_q(transitions, targets)
+        self.update_pi(transitions)
 
     def compute_targets(self, transitions: TransitionBatch):
         """Computes the target rewards
