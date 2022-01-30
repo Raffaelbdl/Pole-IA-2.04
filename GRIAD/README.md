@@ -24,6 +24,8 @@ Then launch dataset_maker.py
 python ./fetch_dataset/dataset_maker.py
 ```
 
+It will run an autopilot and collect observations along the way.
+
 # How to run RL agent
 
 First open CARLA by typing in CARLA folder :
@@ -32,8 +34,11 @@ First open CARLA by typing in CARLA folder :
 ./CarlaUE4.sh --carla-world-port=3000 -opengl
 ```
 
-Then launch rl_main.py configured as you wanted
+Then launch rl_main.py configured as you want
 
 ```bash
 python ./rl/rl_main.py
 ```
+
+
+There is no evaluation pipeline, since training results weren't yet good enough.
