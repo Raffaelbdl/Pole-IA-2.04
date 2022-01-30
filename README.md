@@ -5,7 +5,7 @@ This is the code associated with our first semester project in second year at Ce
 Our project is separated into two parts:
 
 * The first part is our GRIAD implementation, that focuses on a state of the art method.
-* The second part is the fusion of two existing state of the art algorithms.
+* The second part is the fusion of two existing state of the art algorithms that focus on architecture.
 
 The procedure to use them is explained in the README.md in the appropriate sub-folder.
 
