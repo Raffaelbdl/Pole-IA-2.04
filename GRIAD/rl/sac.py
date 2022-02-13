@@ -6,18 +6,19 @@ import gym
 from functools import partial
 
 import jax
-from jax import numpy as jnp, jit, nn, grad, vmap
+from jax import numpy as jnp, jit, nn, grad, vmap, value_and_grad as vgrad
 from jax._src.prng import PRNGKeyArray
 
 import haiku as hk
 from haiku.initializers import VarianceScaling as Vscale
+from haiku.data_structures import to_mutable_dict, to_haiku_dict
 import optax
 
-from coax.experience_replay import SimpleReplayBuffer
-from coax.reward_tracing import TransitionBatch, NStep
-
-from rl.fill_buffer import fill_buffer
+from rl.buffer import Buffer, TransitionBatch
+# from rl.fill_buffer import fill_buffer
 from rl.gym_carla_full.envs.carla_env_full import MAX_STEPS, CarlaEnv
+
+# TODO Add offline memory (fill buffer etc)
 
 class UnetSimple(hk.Module):
     """Encoder Part of the UNet Module    
@@ -117,6 +118,41 @@ def _unet_full(inputs: jnp.ndarray):
 
     return net(inputs)
 
+log2pi = onp.log(2*onp.pi)
+
+
+class SquashedNormal():
+
+    def __init__(self, 
+                 action_space: gym.spaces.Box,
+                 log_std_min: float, 
+                 log_std_max: float):
+
+        self.log_std_min = jnp.array(log_std_min)
+        self.log_std_max = jnp.array(log_std_max)
+
+        self.high = jnp.array(action_space.high)
+        self.low = jnp.array(action_space.low)
+
+
+    @partial(jit, static_argnums=(0))
+    def sample(self, 
+               rng: PRNGKeyArray, 
+               Mu: jnp.ndarray, 
+               logStd: jnp.ndarray):
+        
+        _Mu = (jnp.tanh(Mu) - 1) * (self.high - self.low) / 2 + self.high
+        _logStd = (jnp.tanh(logStd) - 1) * (self.log_std_max - self.log_std_min) / 2 + self.log_std_max
+        _Std = jnp.exp(_logStd) + 1e-6
+
+        U = jax.random.normal(rng, shape=Mu.shape) * _Std + _Mu
+        A = jnp.tanh(U)
+
+        logP = -0.5 * _Mu.shape[-1] * log2pi - jnp.sum(_logStd, axis=-1) - 0.5 * jnp.sum(jnp.square((U - _Mu) / _Std), axis=-1) \
+                - jnp.sum(jnp.log(1 - jnp.square(A) + 1e-9), axis=-1)
+
+        return A, logP
+
 
 class SAC():
     """Our implementation of Soft Actor Critic (SAC) + Conservative Q Learning (CQL)
@@ -143,169 +179,169 @@ class SAC():
     """
 
     def __init__(self, 
-                pi_func, q_func,
                 env: gym.Env, 
+                seed: int = 0,
                 pi_lr: float = 1e-4,
                 q_lr: float = 1e-4,
                 buffer_capacity: int = 4000,
                 batch_size: int = 16,
-                alpha: float = 0.2, polyak: float = 0.995):
+                gamma: float = 0.99,
+                alpha: float = 0.2, 
+                tau: float = 0.005):
         """Init SAC-CQL
         """
-        key = jax.random.PRNGKey(0)
-        self.rng, _rng1, _rng2, _rng3, _rng4, _rng5 = jax.random.split(key, 6)
+        self.rng, rng1, rng2, rng3 = jax.random.split(jax.random.PRNGKey(seed), 4)
 
+        
+        observation_space = env.observation_space
+        action_space = env.action_space
 
-        # Env
-        self.env = env
-        self.dummy_obs = dummy_obs = jnp.expand_dims(
-                                        jnp.array(env.reset(), dtype=jnp.float32), axis=0)
-        self.dummy_action = dummy_action = jnp.expand_dims(
-                                            jnp.array(env.action_space.sample(), dtype=jnp.float32), axis=0)
+        dummy_S = jnp.expand_dims(jnp.zeros(observation_space.shape, dtype=jnp.float32), axis=0)
+        dummy_A = jnp.expand_dims(jnp.zeros(action_space.shape, dtype=jnp.float32), axis=0)
 
+        self.squashed_normal = SquashedNormal(action_space, -4., 0.)
 
-        # Init policy
-        pi_transformed = hk.without_apply_rng(hk.transform(pi_func))
-        self.pi_params = pi_transformed.init(_rng1, dummy_obs, True)
+        def func_pi(S):
+            """
+                outputs scaled actions
+            """
+            seq = hk.Sequential((
+                hk.Conv2D(512, 3, 2, padding="SAME"),
+                hk.Conv2D(256, 3, 1, padding="VALID"),
+                hk.Conv2D(128, 3, 1, padding="VALID"),
+                hk.Flatten(),
+                hk.Linear(128), jax.nn.relu,
+                hk.Linear(128), jax.nn.relu,
+                hk.Linear(2 * action_space.shape[0], jnp.zeros),
+                hk.Reshape((action_space.shape[0], 2))
+            ))
+            Dist = seq(S)
+            Mu = Dist[..., 0]
+            logStd = Dist[..., 1]
+
+            return {"Mu": Mu, "logStd": logStd}
+        
+        def func_q(S, A):
+            seq_s = hk.Sequential((
+                hk.Conv2D(512, 3, 2, padding="SAME"),
+                hk.Conv2D(256, 3, 1, padding="VALID"),
+                hk.Conv2D(128, 3, 1, padding="VALID"),
+                hk.Flatten()))
+            seq_tot = hk.Sequential((
+                hk.Linear(128), jax.nn.relu,
+                hk.Linear(128), jax.nn.relu,
+                hk.Linear(1)
+            ))
+            Q = seq_tot(jnp.concatenate((seq_s(S), A), axis=-1))
+
+            return Q
+        
+        # Policy
+        pi_transformed = hk.without_apply_rng(hk.transform(func_pi))
+        self.pi_params = pi_transformed.init(rng1, dummy_S)
         self._pi = jit(pi_transformed.apply)
 
         self.pi_opt = optax.adam(pi_lr)
         self.pi_opt_state = self.pi_opt.init(self.pi_params)
 
-
-        # Init q
-        q_transformed = hk.without_apply_rng(hk.transform(q_func))
-        self.q_params_1 = q_transformed.init(_rng2, dummy_obs, dummy_action, True)
-        self.q_params_2 = q_transformed.init(_rng3, dummy_obs, dummy_action, True)
-        self.q_params_tar_1 = q_transformed.init(_rng4, dummy_obs, dummy_action, True)
-        self.q_params_tar_2 = q_transformed.init(_rng5, dummy_obs, dummy_action, True)
+        # Q
+        q_transformed = hk.without_apply_rng(hk.transform(func_q))
+        self.q_params_1 = q_transformed.init(rng2, dummy_S, dummy_A)
+        self.q_params_2 = q_transformed.init(rng3, dummy_S, dummy_A)
+        self.q_params_tar_1 = to_haiku_dict(to_mutable_dict(self.q_params_1))
+        self.q_params_tar_2 = to_haiku_dict(to_mutable_dict(self.q_params_2))
         self._q = jit(q_transformed.apply)
 
-        self.q_opt_1 = optax.adam(q_lr)
-        self.q_opt_1_state = self.q_opt_1.init(self.q_params_1)
-        self.q_opt_2 = optax.adam(q_lr)
-        self.q_opt_2_state = self.q_opt_2.init(self.q_params_2)
+        self.q_opt = optax.adam(q_lr)
+        self.q_opt_state_1 = self.q_opt.init(self.q_params_1)
+        self.q_opt_state_2 = self.q_opt.init(self.q_params_2)
 
-
-        # ReplayBuffer
-        self.buffer = SimpleReplayBuffer(buffer_capacity)
-        self.buffer_online = SimpleReplayBuffer(buffer_capacity)
+        # Buffer
+        self.buffer = Buffer(buffer_capacity)
         self.batch_size = batch_size
 
-
         # Hyperparameters
-        self.alpha = alpha
-        self.polyak = polyak
+        self.gamma = gamma
+        self.alpha = alpha # to make differentiable in v2
+        self.tau = tau
 
-    def select_action(self, obs_batched: jnp.ndarray, rng: PRNGKeyArray = None):
-        """Selects an action given a batched observation
-        
-        Args:
-            obs_batched: A batched jnp.ndarray with first dimension equals to 1
-            rng: A PRNGKeyArray
-        """
-        if rng is not None:
-            _rng1 = rng
-        else:
-            self.rng, _rng1 = jax.random.split(self.rng)
+        def apply_gradients(grads, opt: optax.GradientTransformation, opt_state, params):
+            updates, opt_state = opt.update(grads, opt_state, params)
+            params = optax.apply_updates(params, updates)
+            return params, opt_state
+        self.apply_gradients = partial(jit, static_argnums=(1))(apply_gradients)
 
-        dists = self._pi(self.pi_params, obs_batched, False)
-        
-        action = nn.tanh(jax.random.normal(_rng1, shape=(2,)) * dists[(1,3)] + dists[(0,2)])
-        
-        action = jnp.clip(action, self.env.action_space.low, self.env.action_space.high)
+    def select_action(self, rng: PRNGKeyArray, s: jnp.ndarray):
 
-        return action
+        S = jnp.expand_dims(s, axis=0)
+        Dist = self._pi(self.pi_params, S)
+        Mu, logStd = Dist["Mu"], Dist["logStd"]
+
+        A, logP = self.squashed_normal.sample(rng, Mu, logStd)
+
+        return A[0], logP[0]
     
-    def act(self, obs, rng=None):
-        """Selects an action given an observation
+    def improve(self):
+
+        transitions = self.buffer.sample(self.batch_size)
+        S = jnp.array(transitions.S, dtype=jnp.float32)
+        A = jnp.array(transitions.A, dtype=jnp.float32) 
+        R = jnp.array(transitions.R, dtype=jnp.float32)
+        Done = jnp.array(transitions.Done)
+        S_next = jnp.array(transitions.S_next, dtype=jnp.float32)
+
+        self.rng, rng1, rng2 = jax.random.split(self.rng, 3)
+
+        loss_q = self.update_q(rng1, S, A, R, Done, S_next)
+        loss_pi = self.update_pi(rng2, S)
+        self.q_params_tar_1 = self.soft_update(self.q_params_tar_1, self.q_params_1)
+        self.q_params_tar_2 = self.soft_update(self.q_params_tar_2, self.q_params_2)
+
+        return loss_q, loss_pi
+
+
+    def update_q(self, rng, S, A, R, Done, S_next):
         
-        Args:
-            obs: A jnp.ndarray
-            rng: A PRNGKeyArray
-        """
+        Tar = jax.lax.stop_gradient(self.compute_Tar(rng, self.pi_params, self.q_params_tar_1, self.q_params_tar_2, R, Done, S_next))
 
-        obs_batched = jnp.expand_dims(obs, axis=0)
+        loss_q_1, grads_1 = vgrad(self.loss_q, has_aux=False)(self.q_params_1, self.pi_params, S, A, S_next, Tar)
+        self.q_params_1, self.q_opt_state_1 = self.apply_gradients(grads_1, self.q_opt, 
+                                                                   self.q_opt_state_1, self.q_params_1)
 
-        return self.select_action(obs_batched, rng)
-    
-    def improve(self, offline_split: float = 1.):
-        """Improves the policy and the action value
+        loss_q_2, grads_2 = vgrad(self.loss_q, has_aux=False)(self.q_params_2, self.pi_params, S, A, S_next, Tar)
+        self.q_params_2, self.q_opt_state_2 = self.apply_gradients(grads_2, self.q_opt, 
+                                                                   self.q_opt_state_2, self.q_params_2)
 
-        Args:
-            offline_split: A float that corresponds to the part of expert demonstrations used        
-        """
+        return (loss_q_1 + loss_q_2) / 2
 
-        if offline_split < 1.:
-            num_offline = int(self.batch_size * offline_split)
-            num_online = int(self.batch_size * (1 - offline_split))
-            transitions_off: TransitionBatch = self.buffer.sample(batch_size=num_offline)
-            transitions_on: TransitionBatch = self.buffer.sample(batch_size=num_online)
-            transitions = jax.tree_multimap(lambda x, y: jnp.concatenate([x, y], axis=0), 
-                                            transitions_off, transitions_on)
-        else:
-            transitions: TransitionBatch = self.buffer.sample(batch_size=self.batch_size)
-
-        targets = self.compute_targets(transitions)
-        self.update_q(transitions, targets)
-        self.update_pi(transitions)
-
-    def compute_targets(self, transitions: TransitionBatch):
-        """Computes the target rewards
-
-        with entropy term from SAC
-        
-        Args:
-            transitions: A coax TransitionBatch to sample transitions        
-        """
-        
-        dists = self._pi(self.pi_params, transitions.S_next, False)
-
-        means = jnp.transpose(jnp.stack([dists[:,0], dists[:,2]], axis=0))
-        stds = jnp.transpose(jnp.stack([dists[:,1], dists[:,3]], axis=0))
-
-        pis = jnp.exp(-0.5 * jnp.power(((transitions.A - means) / stds), 2)) / (stds * jnp.sqrt(2 * jnp.pi))
-
-
-        targets = jnp.minimum(self._q(self.q_params_1, transitions.S_next, transitions.A, False), 
-                              self._q(self.q_params_2, transitions.S_next, transitions.A, False))
-        targets -= self.alpha * jnp.log(pis)
-
-        targets = jnp.expand_dims(transitions.Rn, axis=-1) + jnp.expand_dims(transitions.In, axis=-1) * targets
-
-        return targets
-
-    def update_q(self, transitions: TransitionBatch, targets: jnp.ndarray):
-        """Performs a single step of gradient descent on the action value
-
-        Args:
-            transitions: A coax TransitionBatch
-            targets: A jnp.ndarray that corresponds to the target reward        
-        """
-
-        grads1 = grad(self.q_loss)(self.q_params_1, transitions.S, transitions.A, transitions.S_next, targets)
-        updates, self.q_opt_1_state = self.q_opt_1.update(grads1, self.q_opt_1_state, self.q_params_1)
-        self.q_params_1 = optax.apply_updates(self.q_params_1, updates)
-
-        grads2 = grad(self.q_loss)(self.q_params_2, transitions.S, transitions.A, transitions.S_next, targets)
-        updates, self.q_opt_2_state = self.q_opt_2.update(grads2, self.q_opt_2_state, self.q_params_2)
-        self.q_params_2 = optax.apply_updates(self.q_params_2, updates)
     
     @partial(jit, static_argnums=(0))
-    def q_loss(self, q_params, observations, actions, next_observations, targets):
-        """Computes the loss for the action value
+    def compute_Tar(self, rng, pi_params, q_params_tar_1, q_params_tar_2, R, Done, S_next):
+        nDone = jnp.where(Done, 0., 1.)
 
-        Args:
-            q_params: A FlatMap that contains the params of the action value
-            observations: A jnp.ndarray that corresponds to the transtions observations
-            actions: A jnp.ndarray that corresponds to the transitions actions
-            next_observations: A jnp.ndarray that corresponds to the transitions next_observations    
-            targets: A jnp.ndarray that corresponds to the target reward        
-        """
-        return jnp.mean(jnp.square(self._q(q_params, observations, actions, True) - targets)) \
-            + self.cql_loss(q_params, observations, actions, next_observations)
+        Dist_next = self._pi(pi_params, S_next)
+        Mu, logStd = Dist_next["Mu"], Dist_next["logStd"]
+        A_next, logP_next = self.squashed_normal.sample(rng, Mu, logStd)
 
-    def cql_loss(self, q_params, observations, actions, next_observations):
+        Q_mini_next = jnp.minimum(
+            self._q(q_params_tar_1, S_next, A_next),
+            self._q(q_params_tar_2, S_next, A_next)
+        )
+
+        Tar = jnp.expand_dims(R, axis=-1) + \
+            self.gamma * jnp.expand_dims(nDone, axis=-1) * \
+                (Q_mini_next - self.alpha * jnp.expand_dims(logP_next, axis=-1))
+
+        return Tar
+     
+
+    @partial(jit, static_argnums=(0))
+    def loss_q(self, q_params, pi_params, S, A, S_next, Tar):
+        loss = jnp.square(self._q(q_params, S, A) - Tar)
+        return jnp.mean(loss) + self.cql_loss(q_params, pi_params, S, A, S_next)
+
+
+    def cql_loss(self, q_params, pi_params, observations, actions, next_observations):
         """Computes the supplementary loss for CQL
 
         Args:
@@ -315,11 +351,11 @@ class SAC():
             next_observations: A jnp.ndarray that corresponds to the transitions next_observations        
         """
 
-        self.rng, _rng1 = jax.random.split(self.rng)
+        self.rng, _rng1 = jax.random.split(self.rng, 2)
 
         rand_actions = jax.random.uniform(_rng1, shape=actions.shape, minval=-1, maxval=1)
-        new_actions = vmap(self.act)(observations)
-        new_next_actions = vmap(self.act)(next_observations)
+        new_actions = self._pi(pi_params, observations)
+        new_next_actions = self._pi(pi_params, next_observations)
         
         q_rd = self._q(q_params, observations, rand_actions, True)
         q_cur = self._q(q_params, observations, new_actions, True)
@@ -332,47 +368,35 @@ class SAC():
 
         return loss
 
-    def update_pi(self, transitions):
-        """Performs a single step of gradient descent on the policy
 
-        Args:
-            transitions: A coax TransitionBatch   
-        """
+    def update_pi(self, rng, S):
+        loss_pi, grads = vgrad(self.loss_pi)(self.pi_params, self.q_params_1, self.q_params_2, rng, S)
+        self.pi_params, self.pi_opt_state = self.apply_gradients(grads, self.pi_opt,
+                                                                 self.pi_opt_state, self.pi_params)
+        return loss_pi
 
-        actions = vmap(self.act)(transitions.S)
-
-        qs = jnp.minimum(self._q(self.q_params_1, transitions.S, actions, False), self._q(self.q_params_2, transitions.S, actions, False))
-
-        grads = grad(self.pi_loss)(self.pi_params, transitions.S, actions, qs)
-        updates, self.pi_opt_state = self.pi_opt.update(grads, self.pi_opt_state, self.pi_params)
-        self.pi_params = optax.apply_updates(self.pi_params, updates)
     
     @partial(jit, static_argnums=(0))
-    def pi_loss(self, pi_params, observations, actions, qs):
-        """Computes the loss for the policy:
+    def loss_pi(self, pi_params, q_params_1, q_params_2, rng: PRNGKeyArray, S):
 
-        Args:
-            pi_params: A FlatMap that contains the params of the policy
-            observations: A jnp.ndarray that corresponds to the transtions observations
-            actions: A jnp.ndarray that corresponds to the transitions actions
-            qs: A jnp.ndarray that corresponds to the action values of the transitions
-        """
+        Dist = self._pi(pi_params, S)
+        Mu, logStd = Dist["Mu"], Dist["logStd"] 
+        A, logP = self.squashed_normal.sample(rng, Mu, logStd)
+    
+        Q_mini = jnp.minimum(
+            self._q(q_params_1, S, A),
+            self._q(q_params_2, S, A)
+        )
 
-        dists = self._pi(pi_params, observations), True
+        loss_pi = - Q_mini + self.alpha * jnp.expand_dims(logP, axis=-1)
+        
+        return jnp.mean(loss_pi)
 
-        means = jnp.transpose(jnp.stack([dists[:,0], dists[:,2]], axis=0))
-        stds = jnp.transpose(jnp.stack([dists[:,1], dists[:,3]], axis=0))
 
-        pis = jnp.exp(-0.5 * jnp.power(((actions - means) / stds), 2)) / (stds * jnp.sqrt(2 * jnp.pi))
-
-        return jnp.mean(qs - self.alpha * jnp.log(pis))
-
-    def update_network(self):
-        """Computes the soft update of the target action values
-        """
-
-        self.q_params_tar_1 = jax.tree_multimap(lambda x, y: self.polyak*x + (1-self.polyak)*y, self.q_params_tar_1, self.q_params_1)
-        self.q_params_tar_2 = jax.tree_multimap(lambda x, y: self.polyak*x + (1-self.polyak)*y, self.q_params_tar_2, self.q_params_2)
+    @partial(jit, static_argnums=(0))
+    def soft_update(self, tar_params, params):
+        return jax.tree_multimap(lambda x, y: (1 - self.tau) * x + self.tau * y, tar_params, params)
+        
 
     def save_agent(self, i):
         pickle5.dump(self.pi_params, open(f"./sac_params/pi_params_{i}", "wb"))
@@ -380,6 +404,7 @@ class SAC():
         pickle5.dump(self.q_params_2, open(f"./sac_params/q_params_2_{i}", "wb"))
         pickle5.dump(self.q_params_tar_1, open(f"./sac_params/q_params_tar_1_{i}", "wb"))
         pickle5.dump(self.q_params_tar_2, open(f"./sac_params/q_params_tar_2_{i}", "wb"))
+
 
     def load_agent(self, i):
         pickle5.load(open(f"./sac_params/pi_params_{i}", "rb"))
@@ -389,35 +414,6 @@ class SAC():
         pickle5.load(open(f"./sac_params/q_params_tar_2_{i}"    , "rb"))
 
 
-def func_pi(S, is_training):
-    seq = hk.Sequential((
-        hk.Conv2D(512, 3, 2, padding="SAME"),
-        hk.Conv2D(256, 3, 1, padding="VALID"),
-        hk.Conv2D(128, 3, 1, padding="VALID"),
-        hk.Flatten(),
-        hk.Linear(8), jax.nn.relu,
-        hk.Linear(8), jax.nn.relu,
-        hk.Linear(8), jax.nn.relu,
-        hk.Linear(4, Vscale(2.))
-    ))
-    x = seq(S)
-    return x
-
-def func_q(S, A, is_training):
-    seq_s = hk.Sequential((
-        hk.Conv2D(512, 3, 2, padding="SAME"),
-        hk.Conv2D(256, 3, 1, padding="VALID"),
-        hk.Conv2D(128, 3, 1, padding="VALID"),
-        hk.Flatten()))
-    seq_tot = hk.Sequential((
-        hk.Linear(8), jax.nn.relu,
-        hk.Linear(8), jax.nn.relu,
-        hk.Linear(8), jax.nn.relu,
-        hk.Linear(1, w_init=jnp.zeros)
-    ))
-    X = jnp.concatenate((seq_s(S), A), axis=-1)
-    return seq_tot(X)
-
 def train(offline_steps: int = 5000,
           online_steps: int = 100000):
 
@@ -426,16 +422,12 @@ def train(offline_steps: int = 5000,
     encoder_params = pickle5.load(open("./params_hub/params_at_92", "rb"))
 
     env = CarlaEnv(unet_func, encoder_params)
-    agent = SAC(func_pi, func_q, env, buffer_capacity=4000, batch_size=24)
-    tracer = NStep(n=5, gamma=0.9)
-
+    agent = SAC(env, buffer_capacity=4000, batch_size=24)
     
-    agent.buffer, tracer = fill_buffer(agent.buffer, tracer, id_to_trans, unet_func, encoder_params)
 
     for _ in tqdm(range(offline_steps)):
         
         agent.improve()
-        agent.update_network()
 
     agent.save_agent(0)
         
@@ -450,22 +442,30 @@ def train(offline_steps: int = 5000,
         s = env.reset()
         env.set_autopilot(False)
 
+        eps = 0
+        ep_r = 0.
         for t in range(MAX_STEPS):
             rng = jax.random.split(rng)[0]
-            a = agent.act(s, rng)
+            a, logp = agent.select_action(s, rng)
             s_next, r, done, info = env.step(a)
-            print('rwd ', r, ' offline split ', offline_split)
+            ep_r += r
 
-            tracer.add(s, a, r, done)
-            while tracer:
-                agent.buffer_online.add(tracer.pop())
+            agent.buffer.add(TransitionBatch._from_singles(s, a, r, done, s_next, logp))
 
-            if len(agent.buffer_online) > 16 and i % 4 == 0:
-                agent.improve(offline_split)
-                agent.update_network()
+            if len(agent.buffer) > agent.batch_size and i % 4 == 0:
+                loss_q, loss_pi = agent.improve()
         
             if done:
-                break
+                s = env.reset()
+                if len(loss_q) > 0:
+                    print(f"episode {eps} | ep rwd {ep_r:.2f} | loss q {sum(loss_q)/len(loss_q):.2f} | loss pi {sum(loss_pi)/len(loss_pi):.2f} ")
+
+                eps += 1
+                ep_r = 0
+
+        else:
+            s = s_next
+
         agent.save_agent(i)
         i += 1
 
@@ -474,71 +474,8 @@ def image_from_pred(pred):
     img = vmap(vmap(lambda x: jnp.array(jnp.argmax(x) *255/13, dtype=jnp.uint8)))(pred)
     return img
 
-def beauty(agent_to_load: int = None, num_steps: int = 100):
-    assert agent_to_load is not None, "Cannot launch Beauty without agent id"
-
-    rng = jax.random.PRNGKey(1)
-    encoder_params = pickle5.load(open("./params_hub/params_at_92", "rb"))
-    _encoder_params = pickle5.load(open("./params_hub/params_at_92", "rb"))
-
-    env = CarlaEnv(unet_func, encoder_params)
-    agent = SAC(func_pi, func_q, env, buffer_capacity=4000, batch_size=24)
-
-    agent.load_agent(282)
-
-    MAX_STEPS = 500
-    offline_split = 0.9
-    T = 0
-    while T < num_steps:
-        offline_split *= 0.999
-        env.clean()
-        s = env.reset()
-        env.set_autopilot(False)
-
-        for t in range(MAX_STEPS):
-
-            rng = jax.random.split(rng)[0]
-            a = agent.act(s, rng)
-            s_next, r, done, info = env.step(a)
-            print('rwd ', r, ' offline split ', offline_split)
-
-            rgb1 = env.obs["RGB"][:,:,0:3].astype(onp.uint8)
-            im = Image.fromarray(rgb1)
-            im.save(f"./beauty/rgb1_{T}.jpeg")
-            rgb2 = env.obs["RGB"][:,:,3:6].astype(onp.uint8)
-            im = Image.fromarray(rgb2)
-            im.save(f"./beauty/rgb2_{T}.jpeg")
-            rgb3 = env.obs["RGB"][:,:,6:9].astype(onp.uint8)
-            im = Image.fromarray(rgb3)
-            im.save(f"./beauty/rgb3_{T}.jpeg")
-
-            rgb = jnp.expand_dims(jnp.concatenate([rgb1.astype(onp.float32), rgb2.astype(onp.float32), rgb3.astype(onp.float32)], axis=-1), axis=0)
-            pred = _unet_full(_encoder_params, rgb)[0]
-            pred1 = onp.array(image_from_pred(pred[:,:,0:13]))
-            im = Image.fromarray(pred1)
-            im.save(f"./beauty/pred1_{T}.jpeg")
-            pred2 = onp.array(image_from_pred(pred[:,:,13:26]))
-            im = Image.fromarray(pred2)
-            im.save(f"./beauty/pred2_{T}.jpeg")
-            pred3 = onp.array(image_from_pred(pred[:,:,26:39]))
-            im = Image.fromarray(pred3)
-            im.save(f"./beauty/pred3_{T}.jpeg")
-
-            seg1 = (onp.repeat(onp.expand_dims(env.obs["Segmentation"][:,:,0], axis=-1), 3, axis=-1)*255/13).astype(onp.uint8)
-            im = Image.fromarray(seg1)
-            im.save(f"./beauty/seg1_{T}.jpeg")
-            seg2 = (onp.repeat(onp.expand_dims(env.obs["Segmentation"][:,:,1], axis=-1), 3, axis=-1)*255/13).astype(onp.uint8)
-            im = Image.fromarray(seg2)
-            im.save(f"./beauty/seg2_{T}.jpeg")
-            seg3 = (onp.repeat(onp.expand_dims(env.obs["Segmentation"][:,:,2], axis=-1), 3, axis=-1)*255/13).astype(onp.uint8)
-            im = Image.fromarray(seg3)
-            im.save(f"./beauty/seg3_{T}.jpeg")
-        
-            if done:
-                break
-
-
 
 if __name__ == "__main__":
+
     train()
         
