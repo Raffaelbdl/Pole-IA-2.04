@@ -28,7 +28,7 @@ This is only a the part of the dataset used in (Transfuser)[https://github.com/a
         - affordances: different types of affordances
         - measurements: contains ego-agent's position, velocity and other metadata
 ```
-For this implementation, only rgb_front, lidar, topdown and measurements are necessary, and a modification to the download bash file might be done in the future to have the rest deleted immediatly.
+For this implementation, only rgb_front, lidar, topdown and measurements are necessary, and a modification to the download bash file might be done in the future to have the rest deleted immediately.
 
 The full dataset is around 200 Go. Should be around 25 Go.
 
@@ -58,7 +58,7 @@ Most of the code was taken and adapted from:
 
 All respect go to Aditya Prakash, Kashyap Chitta and Andreas Geiger.
 
-Here are other several papers on autonomous driving from their group:
+Here are several papers on autonomous driving from their group:
 - [Chitta et al. - NEAT: Neural Attention Fields for End-to-End Autonomous Driving](https://arxiv.org/pdf/2109.04456.pdf)
 - [Prakash et al. - Multi-Modal Fusion Transformer for End-to-End Autonomous Driving](https://arxiv.org/pdf/2104.09224.pdf)
 - [Behl et al. - Label efficient visual abstractions for autonomous driving (IROS'20)](https://arxiv.org/pdf/2005.10091.pdf)
